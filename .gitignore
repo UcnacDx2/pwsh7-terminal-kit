@@ -1,0 +1,8 @@
+# Install.ps1 会把下载的安装包放在仓库根目录，单个几百 MB，不进版本库。
+# 需要时用 Install.ps1 -PowerShellPackage <路径> 指定本地包。
+*.msixbundle
+*.appxbundle
+*.appinstaller
+*.msix
+*.appx
+*_PreinstallKit.zip
