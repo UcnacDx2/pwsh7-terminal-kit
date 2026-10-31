@@ -15,6 +15,11 @@ $Kit = @{
         'Software\Classes\Directory\shell\Powershell',
         'Software\Classes\Drive\shell\Powershell'
     )
+    # powershell.exe 转发器：把 powershell 这个名字重新交还给系统，
+    # 但指向 pwsh 7。装到 Program Files（Users 只读）避免被替换提权。
+    ShimDir         = 'C:\Program Files\AppxInstaller\bin'
+    ShimExe         = 'powershell.exe'
+    ShimSource      = 'PowerShellShim.cs'
 }
 
 # ---------------------------------------------------------
@@ -134,6 +139,10 @@ function New-KitState {
             Registered = $false
         }
         Packages        = @{}
+        Shim            = @{
+            Dir       = $null
+            PathAdded = $null
+        }
     }
 }
 
@@ -144,7 +153,7 @@ function Repair-KitState {
     foreach ($key in $defaults.Keys) {
         if (-not $State.ContainsKey($key)) { $State[$key] = $defaults[$key] }
     }
-    foreach ($sub in @('Paths', 'Associations', 'Packages')) {
+    foreach ($sub in @('Paths', 'Associations', 'Packages', 'Shim')) {
         if ($State[$sub] -isnot [System.Collections.IDictionary]) { $State[$sub] = $defaults[$sub] }
     }
     foreach ($sub in @('HKCU', 'HKLM', 'UserChoice')) {
@@ -152,6 +161,9 @@ function Repair-KitState {
     }
     foreach ($sub in @('UserOriginal', 'MachineOriginal', 'UserRemoved', 'MachineRemoved', 'Modified')) {
         if (-not $State.Paths.ContainsKey($sub)) { $State.Paths[$sub] = $defaults.Paths[$sub] }
+    }
+    foreach ($sub in @('Dir', 'PathAdded')) {
+        if (-not $State.Shim.ContainsKey($sub)) { $State.Shim[$sub] = $defaults.Shim[$sub] }
     }
     return $State
 }
@@ -246,6 +258,38 @@ function Test-RegistryKey {
     return (Test-Path -LiteralPath $Path)
 }
 
+function New-RegistryKeyForce {
+    <#
+      确保注册表键存在（含所有父键）；已存在时只是打开它。
+
+      为什么不用 New-Item -Force：实测在 HKLM 下，PowerShell registry
+      provider 的 -Force 路径对**任意**键都返回 ERROR_ACCESS_DENIED ——
+      连 HKLM\SOFTWARE\Probe 这种全新键也一样，而同一个键改用 .NET 的
+      CreateSubKey 完全正常（HKCU 不受影响）。文件关联步骤要同时写 HKLM
+      与 HKCU，因此会整步失败并以“不允许所请求的注册表访问权”收尾。
+    #>
+    param([string]$Path)
+
+    if (Test-TempHivePath -Path $Path) {
+        [void](Invoke-RegExe -Arguments @('add', (ConvertTo-RegExePath -Path $Path), '/f'))
+        return
+    }
+
+    $match = [regex]::Match($Path, '^(?i)(HKLM|HKCU):\\(.+)$')
+    if ($match.Success) {
+        $root = if ($match.Groups[1].Value -ieq 'HKLM') {
+            [Microsoft.Win32.Registry]::LocalMachine
+        } else {
+            [Microsoft.Win32.Registry]::CurrentUser
+        }
+        $key = $root.CreateSubKey($match.Groups[2].Value)
+        if ($key) { $key.Close() }
+        return
+    }
+
+    New-Item -Path $Path -Force | Out-Null
+}
+
 function New-RegistryKey {
     param([string]$Path)
 
@@ -253,7 +297,7 @@ function New-RegistryKey {
         [void](Invoke-RegExe -Arguments @('add', (ConvertTo-RegExePath -Path $Path), '/f'))
         return
     }
-    if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
+    New-RegistryKeyForce -Path $Path
 }
 
 function Get-RegistryValue {
@@ -315,7 +359,7 @@ function Set-RegistryValue {
         return
     }
 
-    if (-not (Test-Path -LiteralPath $Path)) { New-Item -Path $Path -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $Path)) { New-RegistryKeyForce -Path $Path }
 
     # 注意：Get-Item 返回的 RegistryKey 句柄是只读的，调用 .SetValue() 会抛
     # “无法写入到注册表”，所以统一走 New-ItemProperty。
@@ -632,7 +676,7 @@ function Set-EnvironmentPathValue {
         'HKCU:\Environment'
     }
 
-    if (-not (Test-Path -LiteralPath $keyPath)) { New-Item -Path $keyPath -Force | Out-Null }
+    if (-not (Test-Path -LiteralPath $keyPath)) { New-RegistryKeyForce -Path $keyPath }
     New-ItemProperty -LiteralPath $keyPath -Name 'Path' -Value $Value -PropertyType ExpandString -Force | Out-Null
     Update-EnvironmentBroadcast
 }
@@ -649,6 +693,274 @@ public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint M
         $result = [UIntPtr]::Zero
         [void][KitWin32.NativeMethods]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [UIntPtr]::Zero, 'Environment', 2, 5000, [ref]$result)
     } catch { }
+}
+
+# ---------------------------------------------------------
+#  powershell.exe 转发器（shim）
+# ---------------------------------------------------------
+
+function Get-ShimSourcePath {
+    # Common.ps1 位于 <kit>\lib\，源码与它同目录
+    return (Join-Path $PSScriptRoot $Kit.ShimSource)
+}
+
+function Get-ShimExePath {
+    return (Join-Path $Kit.ShimDir $Kit.ShimExe)
+}
+
+function Test-ShimPresent {
+    # 只有在“……\AppxInstaller\bin”这个约定目录下才算数，
+    # 避免把别处同名的 powershell.exe 误认成本套件装的。
+    return (Test-Path -LiteralPath (Get-ShimExePath))
+}
+
+function Get-ShimVersionInfo {
+    param([string]$ExePath = (Get-ShimExePath))
+
+    if (-not (Test-Path -LiteralPath $ExePath)) { return $null }
+    try {
+        $info = [Diagnostics.FileVersionInfo]::GetVersionInfo($ExePath)
+        return $info.FileVersion
+    } catch { return $null }
+}
+
+function Get-WindowsPowerShellPath {
+    # 系统自带 5.1 的绝对路径。注意 System32 下没有 powershell.exe，
+    # 必须在 WindowsPowerShell\v1.0 这个子目录里找。
+    return (Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe')
+}
+
+function Invoke-ShimCompile {
+    <#
+      在独立的 Windows PowerShell 5.1 进程里编译转发器。
+
+      为什么不直接在本进程 Add-Type：Add-Type -OutputAssembly 会把编译出的
+      类型加载进当前会话，同一会话里第二次调用会因“类型名已存在”直接失败 ——
+      而重复运行安装脚本恰恰是本套件鼓励的做法（出错后“修正问题重新运行”）。
+      开子进程则每次都是干净会话。
+
+      路径通过环境变量传给子进程，脚本本身用 -EncodedCommand 传，
+      彻底绕开命令行引号被二次解析的老问题。
+    #>
+    param([string]$Source, [string]$OutExe)
+
+    $exe = Get-WindowsPowerShellPath
+    if (-not (Test-Path -LiteralPath $exe)) {
+        throw ('找不到 Windows PowerShell 5.1，无法编译转发器：' + $exe)
+    }
+
+    $code = 'Add-Type -Path $env:KIT_SHIM_SRC -OutputAssembly $env:KIT_SHIM_OUT -OutputType ConsoleApplication -ErrorAction Stop'
+    $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
+
+    $previousSource = $env:KIT_SHIM_SRC
+    $previousOutput = $env:KIT_SHIM_OUT
+    try {
+        $env:KIT_SHIM_SRC = $Source
+        $env:KIT_SHIM_OUT = $OutExe
+        $output = & $exe -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand $encoded 2>&1
+        $exitCode = $LASTEXITCODE
+    } finally {
+        $env:KIT_SHIM_SRC = $previousSource
+        $env:KIT_SHIM_OUT = $previousOutput
+    }
+
+    if ($exitCode -ne 0) {
+        throw ('转发器编译失败（退出码 {0}）：{1}' -f $exitCode, (($output | Out-String).Trim()))
+    }
+}
+
+function Install-PowerShellShim {
+    <#
+      编译并安装转发器，然后把它的目录放到机器 PATH 的最前面。
+
+      为什么不直接做个 powershell.cmd：CreateProcess 不查 PATHEXT，
+      Node 的 execFile/spawn 会直接报 ENOENT。必须是真正的 .exe。
+      为什么不用符号链接指向 MSIX 包里的 pwsh.exe：包目录 ACL 拒绝，
+      EPERM/EACCES；直接复制 pwsh.exe 又会缺 pwsh.dll 与运行时。
+    #>
+    param($State)
+
+    $source = Get-ShimSourcePath
+    if (-not (Test-Path -LiteralPath $source)) {
+        throw ('找不到转发器源码：' + $source)
+    }
+
+    $outExe = Get-ShimExePath
+    New-Item -ItemType Directory -Force -Path $Kit.ShimDir | Out-Null
+
+    # 先删旧文件：编译目标已存在时行为不确定，不要留下半新半旧的 exe
+    Remove-Item -LiteralPath $outExe -Force -ErrorAction SilentlyContinue
+
+    Write-Host ('正在编译转发器 -> ' + $outExe) -ForegroundColor DarkGray
+    Invoke-ShimCompile -Source $source -OutExe $outExe
+
+    # 编译时 exe 会被占用，这里等一下再确认产物确实落地了
+    $deadline = (Get-Date).AddSeconds(10)
+    while (-not (Test-Path -LiteralPath $outExe) -and (Get-Date) -lt $deadline) {
+        Start-Sleep -Milliseconds 200
+    }
+
+    if (-not (Test-Path -LiteralPath $outExe)) {
+        throw '转发器编译后没有生成可执行文件。'
+    }
+
+    if (-not $State.Shim) { $State.Shim = @{ Dir = $null; PathAdded = $null; PreviousExe = $null } }
+    $State.Shim.Dir = $Kit.ShimDir
+
+    # 装到机器 PATH 最前：要先于任何别的 powershell 来源
+    if (-not $State.Paths.MachineOriginal) {
+        $State.Paths.MachineOriginal = Get-EnvironmentPathValue -Scope Machine
+    }
+    $machinePath = Get-EnvironmentPathValue -Scope Machine
+    if ($null -eq $machinePath) { $machinePath = '' }
+
+    $newPath = Prepend-PathEntry -Value $machinePath -Entry $Kit.ShimDir
+    if ($newPath -ne $machinePath) {
+        Set-EnvironmentPathValue -Scope Machine -Value $newPath
+        $State.Shim.PathAdded = $Kit.ShimDir
+        Write-Host ('系统 PATH：已置顶 ' + $Kit.ShimDir) -ForegroundColor Green
+    } else {
+        Write-Host '系统 PATH：转发器目录已在最前，无需改动。'
+    }
+
+    return $outExe
+}
+
+function Prepend-PathEntry {
+    param([string]$Value, [string]$Entry)
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    foreach ($part in ($Value -split ';')) {
+        if ([string]::IsNullOrWhiteSpace($part)) { continue }
+        if ($part.TrimEnd('\') -ieq $Entry.TrimEnd('\')) { continue }  # 去重：先摘掉旧的
+        $parts.Add($part)
+    }
+
+    $rebuilt = New-Object System.Collections.Generic.List[string]
+    $rebuilt.Add($Entry)
+    foreach ($part in $parts) { $rebuilt.Add($part) }
+    return ($rebuilt -join ';')
+}
+
+function Remove-PathEntry {
+    param([string]$Value, [string]$Entry)
+
+    $kept = New-Object System.Collections.Generic.List[string]
+    foreach ($part in ($Value -split ';')) {
+        if ([string]::IsNullOrWhiteSpace($part)) { continue }
+        if ($part.TrimEnd('\') -ieq $Entry.TrimEnd('\')) { continue }
+        $kept.Add($part)
+    }
+    return ($kept -join ';')
+}
+
+function Test-PowerShellShim {
+    <#
+      实测转发器是否真的把 powershell 指到了 pwsh 7。
+      返回 PSCustomObject：Ok / Resolved / Detail
+    #>
+    param([int]$TimeoutMs = 30000)
+
+    $exe = Get-ShimExePath
+    if (-not (Test-Path -LiteralPath $exe)) {
+        return [PSCustomObject]@{ Ok = $false; Resolved = $null; Detail = '未安装' }
+    }
+
+    try {
+        $output = & $exe -NoLogo -NoProfile -NonInteractive -Command '$PSVersionTable.PSEdition' 2>&1
+        $resolved = ($output | Out-String).Trim()
+    } catch {
+        return [PSCustomObject]@{ Ok = $false; Resolved = $null; Detail = $_.Exception.Message }
+    }
+
+    if ($resolved -notmatch 'Core') {
+        return [PSCustomObject]@{ Ok = $false; Resolved = $resolved; Detail = ('转发结果不是 PowerShell 7（{0}）' -f $resolved) }
+    }
+
+    return [PSCustomObject]@{ Ok = $true; Resolved = $resolved; Detail = ('-> pwsh 7（{0}）' -f $resolved) }
+}
+
+function Test-ShimNameResolution {
+    <#
+      「新开一个进程，只用名字 powershell 能不能解析到？」——这才是 Node 的
+      execFileSync、Go 的 exec.Command 真正走的那条路（它们不查 PATHEXT，
+      也不接受完整路径以外的任何兜底）。
+
+      Test-PowerShellShim 是拿完整路径调用的，所以当前进程的 PATH 里哪怕
+      根本没有这个名字，它也会报通过 —— 那是个假绿灯。这里从注册表取一份
+      合并后的 PATH 交给子进程，拿到的才是「新开的程序」眼里的结果。
+      返回 PSCustomObject：Ok / Detail
+    #>
+    param([int]$TimeoutMs = 30000)
+
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $user = [Environment]::GetEnvironmentVariable('Path', 'User')
+    if ([string]::IsNullOrEmpty($machine)) { $machine = '' }
+    if ([string]::IsNullOrEmpty($user)) { $user = '' }
+
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = Join-Path $env:SystemRoot 'System32\cmd.exe'
+    $psi.Arguments = '/c powershell -NoLogo -NoProfile -NonInteractive -Command "$PSVersionTable.PSEdition"'
+    $psi.UseShellExecute = $false
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.CreateNoWindow = $true
+    # 顶掉本进程那份旧快照，模拟「重新登录之后」的环境
+    $psi.EnvironmentVariables['Path'] = $machine + ';' + $user
+
+    try { $process = [System.Diagnostics.Process]::Start($psi) } catch {
+        return [PSCustomObject]@{ Ok = $false; Detail = ('无法启动探测进程：' + $_.Exception.Message) }
+    }
+
+    $out = $process.StandardOutput.ReadToEnd()
+    $err = $process.StandardError.ReadToEnd()
+    if (-not $process.WaitForExit($TimeoutMs)) {
+        try { $process.Kill() } catch { }
+        return [PSCustomObject]@{ Ok = $false; Detail = ('探测进程没有在 {0} 秒内退出。' -f [int]($TimeoutMs / 1000)) }
+    }
+
+    if ($process.ExitCode -ne 0) {
+        $firstLine = (($err + $out).Trim() -split "`r?`n")[0]
+        return [PSCustomObject]@{ Ok = $false; Detail = ('解析失败（退出码 {0}）：{1}' -f $process.ExitCode, $firstLine) }
+    }
+
+    $resolved = $out.Trim()
+    if ($resolved -notmatch 'Core') {
+        return [PSCustomObject]@{ Ok = $false; Detail = ('解析到的不是 pwsh 7（{0}）' -f $resolved) }
+    }
+    return [PSCustomObject]@{ Ok = $true; Detail = $resolved }
+}
+
+function Remove-PowerShellShim {
+    param($State)
+
+    $removed = $false
+
+    # 先从 PATH 里摘掉
+    $entry = if ($State -and $State.Shim -and $State.Shim.PathAdded) { $State.Shim.PathAdded } else { $Kit.ShimDir }
+    $machinePath = Get-EnvironmentPathValue -Scope Machine
+    if ($null -ne $machinePath) {
+        $newPath = Remove-PathEntry -Value $machinePath -Entry $entry
+        if ($newPath -ne $machinePath) {
+            Set-EnvironmentPathValue -Scope Machine -Value $newPath
+            Write-Host ('系统 PATH：已移除 ' + $entry) -ForegroundColor Green
+            $removed = $true
+        }
+    }
+
+    if (Test-Path -LiteralPath $Kit.ShimDir) {
+        Remove-Item -LiteralPath $Kit.ShimDir -Recurse -Force -ErrorAction SilentlyContinue
+        # 只在目录确实空了才删掉 bin 的父目录，避免误删用户自己放的东西
+        $parent = Split-Path -Parent $Kit.ShimDir
+        if ((Test-Path -LiteralPath $parent) -and
+            -not (Get-ChildItem -LiteralPath $parent -Force -ErrorAction SilentlyContinue)) {
+            Remove-Item -LiteralPath $parent -Force -ErrorAction SilentlyContinue
+        }
+        Write-Host '已删除转发器目录。' -ForegroundColor Green
+        $removed = $true
+    }
+
+    if (-not $removed) { Write-Host '转发器：无需改动。' }
 }
 
 # ---------------------------------------------------------
@@ -681,11 +993,14 @@ function Register-KitAssociations {
             $hiveState['__progid'] = @{ Existed = (Test-RegistryKey -Path $progPath) }
         }
 
-        New-Item -Path (Join-Path $progPath 'shell\open\command') -Force | Out-Null
-        New-Item -Path (Join-Path $progPath 'DefaultIcon') -Force | Out-Null
+        New-RegistryKeyForce -Path (Join-Path $progPath 'shell\open\command')
+        New-RegistryKeyForce -Path (Join-Path $progPath 'DefaultIcon')
         Set-RegistryDefaultValue -Path $progPath -Value 'Appx / MSIX 安装程序'
         Set-RegistryDefaultValue -Path (Join-Path $progPath 'DefaultIcon') -Value "$env:SystemRoot\System32\shell32.dll,163"
-        Set-RegistryDefaultValue -Path (Join-Path $progPath 'shell\open\command') -Value $command
+        # 必须写成 REG_EXPAND_SZ：命令里的 %LOCALAPPDATA% 只有在 ExpandString 类型下
+        # 才会被资源管理器展开。写成 REG_SZ 时 shell 会把 %LOCALAPPDATA% 当成字面量，
+        # 双击包文件会直接失败（“拒绝访问”/找不到文件）。
+        Set-RegistryValue -Path (Join-Path $progPath 'shell\open\command') -Value $command -Type ExpandString
 
         foreach ($ext in $Kit.Extensions) {
             $extPath = Join-Path $hive.Base $ext
@@ -697,7 +1012,7 @@ function Register-KitAssociations {
                     PerceivedType = (Get-RegistryValue -Path $extPath -Name 'PerceivedType')
                 }
             }
-            New-Item -Path $extPath -Force | Out-Null
+            New-RegistryKeyForce -Path $extPath
             Set-RegistryDefaultValue -Path $extPath -Value $Kit.ProgId
             Set-RegistryValue -Path $extPath -Name 'Content Type' -Value 'application/octet-stream'
             Set-RegistryValue -Path $extPath -Name 'PerceivedType' -Value 'document'
@@ -900,6 +1215,14 @@ function Show-KitStatus {
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     Write-Host ('用户 PATH 含 v1.0 : ' + $(if ($userPath -match '(?i)WindowsPowerShell\\v1\.0') { '是' } else { '否' }))
     Write-Host ('系统 PATH 含 v1.0 : ' + $(if ($machinePath -match '(?i)WindowsPowerShell\\v1\.0') { '是' } else { '否' }))
+
+    if (Test-ShimPresent) {
+        $shimCheck = Test-PowerShellShim
+        $shimState = if ($shimCheck.Ok) { '已安装（' + $shimCheck.Detail + '）' } else { '已安装但异常：' + $shimCheck.Detail }
+    } else {
+        $shimState = '未安装'
+    }
+    Write-Host ('powershell 转发器 : ' + $shimState)
 
     $assoc = Get-RegistryDefaultValue -Path 'HKCU:\Software\Classes\.msix'
     $userChoice = Get-RegistryValue -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Explorer\FileExts\.msix\UserChoice' -Name 'ProgId'

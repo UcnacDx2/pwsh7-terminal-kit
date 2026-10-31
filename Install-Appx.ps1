@@ -3,7 +3,9 @@
     安装 .msix / .msixbundle / .appx / .appxbundle / .appinstaller 包，并可将这些扩展名关联到本脚本。
 
 .DESCRIPTION
-    双击包文件时由关联调用：读取清单 -> 弹窗确认 -> Add-AppxPackage 安装。
+    双击包文件时由关联调用：读取清单 -> 在终端窗口里确认 -> Add-AppxPackage 安装。
+    有控制台窗口时全部走终端文本（资源管理器双击时会分配一个），只有确实没有
+    控制台时才退回弹窗。
     使用 -Register 参数注册文件关联（当前用户；管理员身份下同时注册给所有用户）。
 
 .PARAMETER PackagePath
@@ -44,8 +46,48 @@ function Test-Admin {
     } catch { return $false }
 }
 
+function Test-ConsoleWindow {
+    <#
+      当前进程挂着一个控制台窗口吗？——决定用终端文本还是弹窗。
+
+      为什么不用 [Console]::IsOutputRedirected：输出重定向到文件时它也是
+      true，于是 `Install-Appx.ps1 pkg.msix > log.txt` 反而会弹窗，正好反过来。
+      GetConsoleWindow() 只看有没有控制台，与重定向无关。
+
+      双击文件时资源管理器会给控制台程序分配一个窗口，这里返回 true；
+      万一被某种没有控制台的宿主拉起，就退回弹窗 —— 否则脚本会卡在
+      Read-Host 上等人按键，而根本没人能按。
+    #>
+    if ($null -ne $script:HasConsoleWindow) { return $script:HasConsoleWindow }
+
+    $script:HasConsoleWindow = $false
+    try {
+        if (-not ('Kit.ConsoleWindow' -as [type])) {
+            Add-Type -Namespace Kit -Name ConsoleWindow -ErrorAction Stop -MemberDefinition @'
+[DllImport("kernel32.dll")] private static extern IntPtr GetConsoleWindow();
+public static bool Exists() { return GetConsoleWindow() != IntPtr.Zero; }
+'@
+        }
+        $script:HasConsoleWindow = [Kit.ConsoleWindow]::Exists()
+    } catch { }
+    return $script:HasConsoleWindow
+}
+
 function Show-Message {
     param([string]$Text, [string]$Title = 'Appx 安装程序', [string]$Kind = 'Info')
+
+    if (Test-ConsoleWindow) {
+        $color = switch ($Kind) {
+            'Error' { 'Red' }
+            'Warning' { 'Yellow' }
+            default { 'Gray' }
+        }
+        Write-Host ''
+        Write-Host $Text -ForegroundColor $color
+        [void](Read-Host '按 Enter 退出')
+        return
+    }
+
     try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
         $icon = switch ($Kind) {
@@ -62,6 +104,13 @@ function Show-Message {
 
 function Show-Confirm {
     param([string]$Text, [string]$Title = '确认安装')
+
+    if (Test-ConsoleWindow) {
+        Write-Host ''
+        Write-Host $Text
+        return ((Read-Host '是否安装？输入 Y 安装，直接回车取消') -match '^(?i)y$')
+    }
+
     try {
         Add-Type -AssemblyName System.Windows.Forms -ErrorAction Stop
         $r = [System.Windows.Forms.MessageBox]::Show(
@@ -117,6 +166,32 @@ function Get-PackageInfo {
     return [PSCustomObject]$info
 }
 
+function New-AppxRegistryKey {
+    <#
+      确保注册表键存在（含所有父键）；已存在时只是打开它。
+
+      不能用 New-Item -Force：实测在 HKLM 下，PowerShell registry provider
+      的 -Force 路径对任意键都返回 ERROR_ACCESS_DENIED（连全新的键也一样），
+      而同一个键改用 .NET 的 CreateSubKey 完全正常。本脚本用 -AllUsers
+      注册关联时会写 HKEY_LOCAL_MACHINE，因此会整步失败。
+    #>
+    param([string]$Path)
+
+    $match = [regex]::Match($Path, '^(?i)(?:Registry::)?HKEY_(LOCAL_MACHINE|CURRENT_USER)\\(.+)$')
+    if ($match.Success) {
+        $root = if ($match.Groups[1].Value -ieq 'LOCAL_MACHINE') {
+            [Microsoft.Win32.Registry]::LocalMachine
+        } else {
+            [Microsoft.Win32.Registry]::CurrentUser
+        }
+        $key = $root.CreateSubKey($match.Groups[2].Value)
+        if ($key) { $key.Close() }
+        return
+    }
+
+    New-Item -Path $Path -Force | Out-Null
+}
+
 function Register-AppxAssociations {
     param([switch]$Machine)
 
@@ -143,15 +218,19 @@ function Register-AppxAssociations {
     $base = if ($Machine) { 'Registry::HKEY_LOCAL_MACHINE\SOFTWARE\Classes' } else { 'Registry::HKEY_CURRENT_USER\Software\Classes' }
     $prog = Join-Path $base $ProgId
 
-    New-Item -Path (Join-Path $prog 'shell\open\command') -Force | Out-Null
-    New-Item -Path (Join-Path $prog 'DefaultIcon') -Force | Out-Null
+    New-AppxRegistryKey -Path (Join-Path $prog 'shell\open\command')
+    New-AppxRegistryKey -Path (Join-Path $prog 'DefaultIcon')
     Set-ItemProperty -Path $prog -Name '(default)' -Value $ProgIdFriendly
     Set-ItemProperty -Path (Join-Path $prog 'DefaultIcon') -Name '(default)' -Value "$env:SystemRoot\System32\shell32.dll,163"
-    Set-ItemProperty -Path (Join-Path $prog 'shell\open\command') -Name '(default)' -Value $openCmd
+    # 必须写成 REG_EXPAND_SZ：命令里的 %LOCALAPPDATA% 只有在 ExpandString 类型下
+    # 才会被资源管理器展开。写成 REG_SZ 时 shell 会把 %LOCALAPPDATA% 当成字面量，
+    # 双击包文件会直接失败（“拒绝访问”/找不到文件）。
+    New-ItemProperty -Path (Join-Path $prog 'shell\open\command') -Name '(default)' `
+        -Value $openCmd -PropertyType ExpandString -Force | Out-Null
 
     foreach ($ext in $Extensions) {
         $extKey = Join-Path $base $ext
-        New-Item -Path $extKey -Force | Out-Null
+        New-AppxRegistryKey -Path $extKey
         Set-ItemProperty -Path $extKey -Name '(default)' -Value $ProgId
         New-ItemProperty -Path $extKey -Name 'Content Type' -Value 'application/octet-stream' -PropertyType String -Force | Out-Null
         New-ItemProperty -Path $extKey -Name 'PerceivedType' -Value 'document' -PropertyType String -Force | Out-Null
@@ -201,6 +280,9 @@ function Install-Package {
 }
 
 try {
+    # 双击打开时先给窗口起个名字，否则标题栏是空的，看着像卡住了。
+    try { $Host.UI.RawUI.WindowTitle = 'Appx / MSIX 安装程序' } catch { }
+
     if ($Register) {
         Register-AppxAssociations
         if (Test-Admin) { Register-AppxAssociations -Machine }

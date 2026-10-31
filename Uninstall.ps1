@@ -7,12 +7,13 @@
     回滚顺序与安装顺序相反：
 
       1. 移除 .msix / .appx 文件关联
-      2. 把 WindowsPowerShell\v1.0 重新加回 PATH
-      3. 恢复默认终端设置
-      4. 恢复 Shift + 右键的 PowerShell 菜单项
-      5. 从 .lnk.bak 恢复开始菜单快捷方式
-      6. 移除预配包与已安装的 MSIX 应用（安装前就存在的版本会保留）
-      7. 删除本套件在 ProgramData 下的安装副本与状态文件
+      2. 移除 powershell.exe 转发器（机器 PATH 条目 + Program Files 下的目录）
+      3. 把 WindowsPowerShell\v1.0 重新加回 PATH
+      4. 恢复默认终端设置
+      5. 恢复 Shift + 右键的 PowerShell 菜单项
+      6. 从 .lnk.bak 恢复开始菜单快捷方式
+      7. 移除预配包与已安装的 MSIX 应用（安装前就存在的版本会保留）
+      8. 删除本套件在 ProgramData 下的安装副本与状态文件
 
     Install.ps1 会在 C:\ProgramData\AppxInstaller\state.json 记录每一项修改前的值，
     本脚本据此精确还原；状态文件不存在时，只清理“当前值等于本套件写入值”的项。
@@ -66,13 +67,20 @@ $errorOccurred = $false
 
 try {
     # ---------------------------------------------------------------
-    Write-Step '1/7  移除 .msix / .appx 文件关联'
+    Write-Step '1/8  移除 .msix / .appx 文件关联'
     # ---------------------------------------------------------------
     Unregister-KitAssociations -State $state
     Write-Host '文件关联已还原。' -ForegroundColor Green
 
     # ---------------------------------------------------------------
-    Write-Step '2/7  还原 PATH'
+    Write-Step '2/8  移除 powershell.exe 转发器'
+    # ---------------------------------------------------------------
+    # 必须先于 PATH 还原：这里要从机器 PATH 摘掉转发器目录，
+    # 再让下一步把 WindowsPowerShell\v1.0 加回来。
+    Remove-PowerShellShim -State $state
+
+    # ---------------------------------------------------------------
+    Write-Step '3/8  还原 PATH'
     # ---------------------------------------------------------------
     $userEntries = @()
     $machineEntries = @()
@@ -134,7 +142,7 @@ try {
         }
 
         # -----------------------------------------------------------
-        Write-Step '3/7  恢复默认终端'
+        Write-Step '4/8  恢复默认终端'
         # -----------------------------------------------------------
         foreach ($root in $roots) {
             $startupPath = Join-Path $root.Root 'Console\%%Startup'
@@ -162,7 +170,7 @@ try {
         Write-Host '默认终端已还原。' -ForegroundColor Green
 
         # -----------------------------------------------------------
-        Write-Step '4/7  恢复 Shift + 右键的 PowerShell 菜单项'
+        Write-Step '5/8  恢复 Shift + 右键的 PowerShell 菜单项'
         # -----------------------------------------------------------
         foreach ($root in $roots) {
             $map = $null
@@ -193,7 +201,7 @@ try {
     }
 
     # ---------------------------------------------------------------
-    Write-Step '5/7  恢复开始菜单快捷方式'
+    Write-Step '6/8  恢复开始菜单快捷方式'
     # ---------------------------------------------------------------
     $restored = 0
     foreach ($directory in @(Get-ShortcutDirs)) {
@@ -216,7 +224,7 @@ try {
     Write-Host ('已恢复快捷方式：{0} 个' -f $restored) -ForegroundColor Green
 
     # ---------------------------------------------------------------
-    Write-Step '6/7  卸载预配包与 MSIX 应用'
+    Write-Step '7/8  卸载预配包与 MSIX 应用'
     # ---------------------------------------------------------------
     if ($KeepPackages) {
         Write-Host '已跳过（-KeepPackages）。'
@@ -276,7 +284,7 @@ try {
     }
 
     # ---------------------------------------------------------------
-    Write-Step '7/7  清理安装副本与状态文件'
+    Write-Step '8/8  清理安装副本与状态文件'
     # ---------------------------------------------------------------
     $handlerFile = Join-Path $env:ProgramData 'AppxInstaller\Install-Appx.ps1'
     if (Test-Path -LiteralPath $handlerFile) {
