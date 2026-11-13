@@ -302,6 +302,27 @@ zh-Hans 翻译后网址那一行反而更长（`38 - 58 + 3 = -17`），`String.
 **公司/域环境可能拦截。**
 `Add-AppxProvisionedPackage` 需要 `AppXSvc`、`ClipSVC`、`StateRepository` 正常；组策略可能禁止预配或脚本执行。被拦截时脚本会给出具体错误并保存进度，修正后重跑即可（已完成的步骤不会重复备份）。
 
+**预配报 `拒绝访问`，而且错误只有这一句，多半是注册表键权限，不是组策略。**
+Appx 提供程序初始化时要**以写方式**打开
+
+```
+HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Appx
+```
+
+部分镜像（云主机、做过安全加固的镜像尤其常见）把这个键上的 `BUILTIN\Administrators` 收紧成只读（`ReadKey`），只留 `NT AUTHORITY\SYSTEM` 和 `NT SERVICE\TrustedInstaller` 完全控制。此时**任何**管理员进程都会失败，`C:\Windows\Logs\DISM\dism.log` 里对应：
+
+```
+DISM Appx Provider: Failed to create or open Software key. - CAppxManager::InitializeResources(hr:0x80070005)
+```
+
+一行就能确认是不是这个原因（抛异常 = 被锁，返回非空 = 可写）：
+
+```powershell
+[Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\Microsoft\Windows\CurrentVersion\Appx', $true)
+```
+
+要恢复预配，需要取得该键所有权后给 `Administrators` 完全控制 —— 这等于放松镜像原有的加固，值不值得自行判断。**不修也没有严重后果**：脚本把预配失败降级为警告并继续（当前用户照常装上），代价只是以后新建的用户会拿到镜像里那份旧的预配包。
+
 **安装后会自动检查 `pwsh.exe` / `wt.exe` 执行别名。**
 为所有用户预配（`Add-AppxProvisionedPackage`）会把当前用户的应用状态打回“已暂存”，
 在一些机器上导致执行别名报“找不到可用的应用程序证书”而无法启动。
