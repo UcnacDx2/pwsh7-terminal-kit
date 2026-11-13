@@ -63,7 +63,7 @@
 
 .EXAMPLE
     .\Install.ps1
-    .\Install.ps1 -PowerShellPackage D:\pkg\PowerShell-7.6.7.msixbundle
+    .\Install.ps1 -PowerShellPackage D:\pkg\PowerShell-7.6.10.msixbundle
     .\Install.ps1 -Verify
 #>
 [CmdletBinding()]
@@ -99,11 +99,15 @@ $HandlerFile = Join-Path $StateRoot 'Install-Appx.ps1'
 
 # 下载源按顺序尝试，前一个失败自动换下一个。
 # github.com 在部分网络下直连不通，所以这里只放可用的镜像（实测见 README）。
+#
+# 版本必须是 7.6.9 或更高：7.6.6 / 7.6.7 在 zh-Hans 界面下存在启动崩溃
+# （UpdatesNotification 对本地化文案算负数 PadRight，VT 终端里 pwsh 直接 FailFast），
+# 官方在 7.6.9 移除了整个更新通知功能。详见 README「已知问题」。
 $PowerShellUrls = @(
-    'https://cdn.akaere.online/https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7.msixbundle',
-    'https://ghfast.top/https://github.com/PowerShell/PowerShell/releases/download/v7.6.7/PowerShell-7.6.7.msixbundle'
+    'https://cdn.akaere.online/https://github.com/PowerShell/PowerShell/releases/download/v7.6.10/PowerShell-7.6.10.msixbundle',
+    'https://ghfast.top/https://github.com/PowerShell/PowerShell/releases/download/v7.6.10/PowerShell-7.6.10.msixbundle'
 )
-$PowerShellFileName = 'PowerShell-7.6.7.msixbundle'
+$PowerShellFileName = 'PowerShell-7.6.10.msixbundle'
 $TerminalUrls = @(
     'https://cdn.akaere.online/https://github.com/microsoft/terminal/releases/download/v1.25.2733.0/Microsoft.WindowsTerminal_1.25.2733.0_8wekyb3d8bbwe.msixbundle',
     'https://ghfast.top/https://github.com/microsoft/terminal/releases/download/v1.25.2733.0/Microsoft.WindowsTerminal_1.25.2733.0_8wekyb3d8bbwe.msixbundle'

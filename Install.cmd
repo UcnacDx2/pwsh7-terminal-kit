@@ -2,7 +2,7 @@
 setlocal
 rem Double-click to run. Arguments are passed through, for example:
 rem   Install.cmd -Verify
-rem   Install.cmd -PowerShellPackage "D:\pkg\PowerShell-7.6.7.msixbundle"
+rem   Install.cmd -PowerShellPackage "D:\pkg\PowerShell-7.6.10.msixbundle"
 
 set "PS=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 if not exist "%PS%" goto :nops

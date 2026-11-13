@@ -31,7 +31,7 @@ AIGC:
 
 安装的 MSIX 应用：
 
-- **PowerShell 7.6.7**（`Microsoft.PowerShell_8wekyb3d8bbwe`）
+- **PowerShell 7.6.10**（`Microsoft.PowerShell_8wekyb3d8bbwe`）
 - **Windows Terminal 1.25.2733.0**（`Microsoft.WindowsTerminal_8wekyb3d8bbwe`）
 
 两者都会 `Add-AppxProvisionedPackage` 预配给所有用户，新用户首次登录即可使用。
@@ -54,7 +54,7 @@ AIGC:
 
 | 包 | 下载源 |
 | --- | --- |
-| PowerShell 7.6.7 | `cdn.akaere.online` → `ghfast.top` |
+| PowerShell 7.6.10 | `cdn.akaere.online` → `ghfast.top` |
 | Windows Terminal 1.25.2733.0 | `cdn.akaere.online` → `ghfast.top` |
 
 下载完成后会校验文件是完整可读的包；断流产生的残缺文件会被删除并换下一个源（不会留在缓存里当成有效包）。
@@ -62,7 +62,7 @@ AIGC:
 已经手动下载好安装包？也可以显式指定路径：
 
 ```powershell
-.\Install.cmd -PowerShellPackage "D:\pkg\PowerShell-7.6.7.msixbundle" -TerminalPackage "D:\pkg\Microsoft.WindowsTerminal_1.25.2733.0_8wekyb3d8bbwe.msix"
+.\Install.cmd -PowerShellPackage "D:\pkg\PowerShell-7.6.10.msixbundle" -TerminalPackage "D:\pkg\Microsoft.WindowsTerminal_1.25.2733.0_8wekyb3d8bbwe.msix"
 # 或直接给 OEM 预安装包 zip：
 .\Install.cmd -TerminalPackage "D:\pkg\Microsoft.WindowsTerminal_*_Windows10_PreinstallKit.zip"
 ```
@@ -233,6 +233,39 @@ C:\Program Files\AppxInstaller\bin\powershell.exe
 
 ---
 
+## 已知问题
+
+### zh-Hans 界面下 pwsh 7.6.6 / 7.6.7 启动即崩溃
+
+现象：在 Windows Terminal / conhost 里启动 `pwsh` 立刻退出，终端里只剩：
+
+```
+PowerShell 7.6.7
+Process terminated.
+totalWidth ('-17') must be a non-negative value. (Parameter 'totalWidth')
+   at Microsoft.PowerShell.UpdatesNotification.ShowUpdateNotification(PSHostUserInterface hostUI)
+   at Microsoft.PowerShell.ConsoleHost.Start(...)
+```
+
+原因：`UpdatesNotification.ShowUpdateNotification` 假设通知文案的第一行最长，用它算第二行的补白：
+
+```csharp
+line2Padding = line2Padding.PadRight(line1Length - line2Length + releaseTag.Length);
+```
+
+zh-Hans 翻译后网址那一行反而更长（`38 - 58 + 3 = -17`），`String.PadRight` 抛 `ArgumentOutOfRangeException`；
+该异常在 `ConsoleHost.Start` 里没有捕获，直接 `FailFast` 终止进程。补白代码只在支持 VT 的终端里执行，
+所以从无控制台的进程（如 `execFile`、服务）里调 `pwsh` 反而看不出问题。
+
+- 受影响版本：7.6.6、7.6.7（7.7.0-preview.4/5 同样）
+- 上游 issue：#28131、#28235、#28237、#28238、#28239、#28302
+- 修复：7.6.9 起整个更新通知功能被移除（`UpdatesNotification.cs` 已删除）。本套件因此固定用 **7.6.10**
+
+临时止血（不升级也能用）：删掉 `%LOCALAPPDATA%\Microsoft\PowerShell\<版本>\update*_v*_*`，或设环境变量
+`POWERSHELL_UPDATECHECK=Off`。只删文件的话，7 天后重新检查更新会再次触发。
+
+---
+
 ## 系统要求
 
 - Windows 10 21H2（build 19044）及以上，或 Windows 11（19044 已实测可用）
@@ -244,7 +277,7 @@ C:\Program Files\AppxInstaller\bin\powershell.exe
 
 - Windows 10 IoT Enterprise LTSC 2021（10.0.19044）
 - Windows Server 2022（10.0.20348），x64
-- PowerShell 7.6.7（MSIX，x64）
+- PowerShell 7.6.10（MSIX，x64）
 - Windows Terminal 1.25.2733.0
 - 安装、状态检查、卸载回滚（临时状态文件）均已实际跑通
 - `powershell` 转发器用「差分对照」验证：把同一份原始命令行分别喂给转发器和它应该转发到的真实 exe，比较 stdout / stderr / 退出码；覆盖退出码透传、stdin 管道、`-File` 带空格路径、命令里的 `&` `^` `%`、`-Version 5.1` 拦截等
